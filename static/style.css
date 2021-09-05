@@ -1,0 +1,41 @@
+* {
+  margin: 0;
+}
+
+body {
+  font-family: sans;
+}
+
+div {
+  margin: 5px;
+}
+
+h1 {
+  margin-bottom: 5px;
+}
+
+p {
+  margin-bottom: 2px;
+}
+
+ul {
+  list-style-type: none;
+  padding: 0;
+}
+
+.picked {
+  font-weight: bold;
+}
+
+.secondary {
+  font-style: italic;
+}
+
+.thumbnails {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.thumbnails img {
+  display: block;
+}

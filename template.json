@@ -1,0 +1,29 @@
+{
+  "roundworm_version": 0,
+  "s3": {
+    "bucket": "S3 bucket for the media you want to show",
+    "roundworm_bucket": "S3 bucket for thumbnails etc.",
+    "access_key_id": "S3 access key id",
+    "secret_access_key": "S3 secret access key",
+    "endpoint_url": "useful if you're using a S3 provider other than AWS"
+  },
+  "secret": "a secret used for HMAC-SHA256 signing",
+  "domain": "what domain this will reside on",
+  "static_files": ["static/style.css"],
+  "http_port": 8093,
+  "http_workers": 2,
+  "http_auth_users": {
+    "admin": "admin password"
+  },
+  "thumbnail_size": 400,
+  "prefixes": {
+    "": {
+      "auth": { "dirs": "http", "files": "sign" },
+      "auth_http_users": ["admin"],
+      "sub": {
+        "Food pictures": { "auth": { "dirs": "sign", "files": "sign" } },
+        "Events/": { "auth": { "dirs": "sign", "files": "sign" } },
+      }
+    }
+  }
+}

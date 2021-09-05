@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+import sys
+import os.path
+import argparse
+import json
+import hmac
+import hashlib
+import base64
+import urllib
+import subprocess
+import tempfile
+
+from flask import Flask, request, redirect
+import gunicorn.app.base
+import boto3
+import humanfriendly
+
+roundworm_version = 0
+roundworm_url = 'https://github.com/nqpz/roundworm'
+
+def s3_make_client(config):
+    return boto3.client('s3',
+                        aws_access_key_id=config['s3']['access_key_id'],
+                        aws_secret_access_key=config['s3']['secret_access_key'],
+                        endpoint_url=config['s3']['endpoint_url'])
+
+def s3_list_objects(s3_client, config, prefix, single_level=True):
+    args = {
+        'Bucket': config['s3']['bucket'],
+        'Prefix': prefix
+    }
+    if single_level:
+        args['Delimiter'] = '/'
+    response = s3_client.list_objects_v2(**args)
+    assert not response['IsTruncated'], 'FIXME: handle IsTruncated responses'
+    if single_level:
+        common_prefixes = response.get('CommonPrefixes', [])
+        dirs = [item['Prefix'][len(prefix):] for item in common_prefixes]
+    contents = response.get('Contents', [])
+    files = [[item['Key'][len(prefix):], item['Size']] for item in contents]
+    if single_level:
+        return dirs, files
+    else:
+        return files
+
+def s3_head_object(s3_client, bucket, key):
+    return s3_client.head_object(Bucket=bucket, Key=key)
+
+def s3_get_object(s3_client, config, key):
+    stream = s3_client.get_object(Bucket=config['s3']['bucket'], Key=key)['Body']
+    def writer(fd):
+        for chunk in stream:
+            fd.write(chunk)
+    return writer
+
+def s3_put_object(s3_client, config, key, fd):
+    response = s3_client.put_object(Bucket=config['s3']['roundworm_bucket'], Key=key, Body=fd)
+
+def s3_get_url(config, path):
+    return '{}/{}/{}'.format(config['s3']['endpoint_url'], config['s3']['bucket'], urllib.parse.quote(path))
+
+def s3_sign_url(s3_client, config, path):
+    days_7 = 60 * 60 * 24 * 7
+    return s3_client.generate_presigned_url(
+        'get_object',
+        Params={
+            'Bucket': config['s3']['bucket'],
+            'Key': path
+        },
+        ExpiresIn=days_7)
+
+def load_config(f):
+    config = json.load(f)
+    assert config['roundworm_version'] == roundworm_version, 'this program only supports version 0 configurations'
+    return config
+
+# Taken from https://docs.gunicorn.org/en/stable/custom.html#custom-application
+class GunicornStandaloneApplication(gunicorn.app.base.BaseApplication):
+    def __init__(self, app, options=None):
+        self.options = options or {}
+        self.application = app
+        super().__init__()
+
+    def load_config(self):
+        config = {key: value for key, value in self.options.items()
+                  if key in self.cfg.settings and value is not None}
+        for key, value in config.items():
+            self.cfg.set(key.lower(), value)
+
+    def load(self):
+        return self.application
+
+def digest_path(config, path):
+    h = hmac.new(config['secret'].encode('utf-8'), digestmod=hashlib.sha256)
+    h.update(path.encode('utf-8'))
+    return h.digest()
+
+def share_sig(config, path):
+    data = b'_'.join([
+        str(roundworm_version).encode(),
+        str(1 if is_dir(path) else 0).encode(),
+        str(path.count('/')).encode(),
+        digest_path(config, path)
+    ])
+    return base64.urlsafe_b64encode(data).decode('utf-8')
+
+def sig_parts(sig):
+    sig_data = base64.urlsafe_b64decode(sig.encode('utf-8'))
+    sig_parts = sig_data.split(b'_', 3)
+    assert int(sig_parts[0]) == roundworm_version, 'this program only supports version 0 signed URLs'
+    sig_is_dir = int(sig_parts[1]) == 1
+    sig_n_slashes = int(sig_parts[2])
+    sig_digest = sig_parts[3]
+    return sig_is_dir, sig_n_slashes, sig_digest
+
+def check_share_sig(config, path, sig):
+    sig_is_dir, sig_n_slashes, sig_digest = sig_parts(sig)
+    path_n_slashes = path.count('/')
+    if sig_is_dir and (sig_n_slashes < path_n_slashes or not is_dir(path)):
+        path = path.rsplit('/', path_n_slashes - sig_n_slashes + 1)[0] + '/'
+        assert auth_required(config, path) in ['sign', 'http']
+    path_digest = digest_path(config, path)
+
+    return hmac.compare_digest(sig_digest, path_digest)
+
+def share_url(config, path):
+    if not auth_required(config, path) in ['sign', 'http']:
+        return None
+    s = share_sig(config, path)
+    return 'https://{}/{}?s={}'.format(config['domain'], urllib.parse.quote(path), s)
+
+def is_dir(path):
+    return path == '' or path.endswith('/')
+
+def auth_required_base(config, path):
+    def check(prefixes):
+        for prefix, info in prefixes.items():
+            match = False
+            if prefix.endswith('/'):
+                match = path.rstrip('/').startswith(prefix)
+            else:
+                match = path.startswith(prefix + '/') or prefix == ''
+
+            if match:
+                sub = info.get('sub')
+                if sub is not None:
+                    auth = check(sub)
+                    if auth is not None:
+                        return auth
+                return info['auth']
+                break
+        return None
+
+    auth = check(config['prefixes'])
+    if auth is None:
+        auth = {'dirs': 'private', 'files': 'private'}
+    return auth
+
+def auth_required(config, path):
+    auth = auth_required_base(config, path)
+    return auth['dirs'] if is_dir(path) else auth['files']
+
+def check_auth(config, auth):
+    if auth:
+        password = config['http_auth_users'].get(auth.username)
+        if password is not None and password == auth.password:
+            return True
+    return False
+
+def check_sig(config, path):
+    sig = request.args.get('s')
+    return sig is not None and check_share_sig(config, path, sig)
+
+def thumbnail_key(config, path):
+    return 'thumbnails/{}/{}.jpg'.format(
+        base64.urlsafe_b64encode(digest_path(config, path)).decode(),
+        path)
+
+def thumbnail_url(config, path):
+    return '{}/{}/{}'.format(
+        config['s3']['endpoint_url'],
+        config['s3']['roundworm_bucket'],
+        urllib.parse.quote(thumbnail_key(config, path)))
+
+def read_file(name):
+    with open(name, 'r') as f:
+        return f.read()
+
+base_dir = os.path.dirname(__file__)
+template = read_file(os.path.join(base_dir, 'template.html'))
+
+def render(s3_client, config, path, auth):
+    if is_dir(path):
+        sig = request.args.get('s')
+
+        show = request.args.get('show', 'list')
+        show_url_part = '' if show == 'list' else ('&' if sig is not None else '?') + 'show=thumbnails'
+
+        s_maybe = '?s={}'.format(sig) if sig is not None else ''
+        to_url = lambda path1: urllib.parse.quote(path1) + s_maybe
+        dirs, files = s3_list_objects(s3_client, config, path)
+
+        hparts0 = path.rstrip('/').split('/')
+        prev_hparts0 = ''
+        hparts = []
+        for part0, i in zip(hparts0, range(len(hparts0))):
+            part = prev_hparts0 + '/' + part0
+            hparts.append((i + 1, part + '/', part0))
+            prev_hparts0 = part
+        _sig_is_dir, sig_n_slashes, _sig_digest = sig_parts(sig)
+        body = '<div><h1>{}/</h1></div>\n'.format('/'.join('<a href="{}">{}</a>'.format(to_url(part[1]) + show_url_part, part[2]) if sig_n_slashes <= part[0] and part[0] < len(hparts) else part[2] for part in hparts))
+
+        body += '<div>'
+        for file in files:
+            file.append(to_url(file[0]))
+        if show == 'list':
+            body += '<ul>'
+            body += '\n'.join('<li><a href="{}">{}</a></li>'.format(to_url(dir) + show_url_part, dir) for dir in dirs) + '\n'
+            body += '\n'.join('<li><a href="{}">{}</a> ({})</li>'.format(file[2], file[0], humanfriendly.format_size(file[1])) for file in files) + '\n'
+            body += '</ul>\n'
+        elif show == 'thumbnails':
+            body += '<ul>'
+            body += '\n'.join('<li><a href="{}">{}</a></li>'.format(to_url(dir) + show_url_part, dir) for dir in dirs)
+            body += '</ul></div><div class="thumbnails">'
+            body += '\n'.join('<div><a href="{}"><img src="{}">{} ({})</a></div>'.format(file[2], thumbnail_url(config, path + file[0]), file[0], humanfriendly.format_size(file[1])) for file in files)
+
+        body += '</div>'
+
+        footer = ''
+
+        list_html = '<span class="picked">List</span>' if show == 'list' else '<a href="?s={}">List</a>'.format(sig)
+        thumbnails_html = '<span class="picked">Thumbnails</span>' if show == 'thumbnails' else '<a href="?s={}&show=thumbnails">Thumbnails</a>'.format(sig)
+        footer += '<p>Show: {} | {}</p>\n'.format(list_html, thumbnails_html)
+
+        if share_sig(config, path) != sig:
+            url = share_url(config, path)
+            if url is not None:
+                footer += '<p>Share this directory only: <input value="{}" readonly></p>\n'.format(url)
+
+        curl_command = 'curl {}-L# '.format('--basic --user <username> ' if auth == 'http' else '') + ' '.join('-o {} {}'.format(file[0], 'https://{}/{}'.format(config['domain'], urllib.parse.quote(path) + file[2])) for file in files)
+        footer += '<p>Download all files in this directory: <input value="{}" readonly></p>\n'.format(curl_command)
+
+        if footer != '':
+            body += '<hr>\n<div>{}</div>'.format(footer)
+
+        body += '<hr>\n<div><p class="secondary">Powered by <a href="{}">roundworm</a> version {}.</p></div>\n'.format(roundworm_url, roundworm_version)
+
+        return template.format(path=path, body=body)
+    else:
+        return redirect(s3_sign_url(s3_client, config, path) if auth != 'none'
+                        else s3_get_url(config, path))
+
+def handle_request(s3_client, static_files, config, path):
+    static = static_files.get(path)
+    if static is not None:
+        return static
+
+    auth = auth_required(config, path)
+    _check_sig = lambda: check_sig(config, path)
+    _render = lambda: render(s3_client, config, path, auth)
+    not_found = ('Not found', 404)
+
+    if auth == 'private':
+        return not_found
+    elif auth == 'http':
+        if not _check_sig():
+            return not_found
+        if not check_auth(config, request.authorization):
+            return ('Unauthorized', 401, {
+                'WWW-Authenticate': 'Basic realm="Login required"'
+            })
+        else:
+            return _render()
+    elif auth == 'sign':
+        if _check_sig():
+            return _render()
+        else:
+            return not_found
+    elif auth == 'none':
+        return _render()
+
+def serve(args):
+    config = load_config(args.config)
+    s3_client = s3_make_client(config)
+
+    static_files = config.get('static_files', [])
+    static_files = {name: read_file(name) for name in static_files}
+
+    app = Flask(__name__)
+    _handle_request = lambda path: handle_request(s3_client, static_files, config, path)
+    app.add_url_rule('/', defaults={'path': ''}, view_func=_handle_request)
+    app.add_url_rule('/<path:path>', view_func=_handle_request)
+
+    gunicorn_options = {
+        'bind': '{}:{}'.format('0.0.0.0', config['http_port']),
+        'workers': config['http_workers'],
+    }
+    GunicornStandaloneApplication(app, gunicorn_options).run()
+
+def get_share_url(args):
+    config = load_config(args.config)
+    path = args.path
+    url = share_url(config, path)
+    if url is None:
+        print('error: signed urls are not accepted for this path', file=sys.stderr)
+        sys.exit(1)
+    print(url)
+
+def generate_thumbnails(args):
+    config = load_config(args.config)
+    s3_client = s3_make_client(config)
+
+    prefixes_to_handle = []
+    def check_prefixes(prefixes):
+        for prefix, info in prefixes.items():
+            if info['auth']['dirs'] != 'http':
+                if not prefix.endswith('/'):
+                    prefix = prefix + '/'
+                prefixes_to_handle.append(prefix)
+            else:
+                check_prefixes(info.get('sub', {}))
+    check_prefixes(config['prefixes'])
+
+    files = []
+    for prefix in prefixes_to_handle:
+        files.extend(prefix + item[0] for item in s3_list_objects(s3_client, config, prefix, single_level=False))
+
+    n = len(files)
+    for file, i in zip(files, range(1, n + 1)):
+        # fixme: video as well + check if necessary + support regenerating only one prefix + parallelize + max 400 on either width or height + clean unused files
+        print('{:03d}/{:03d}'.format(i, n), file)
+        file_lastmod = s3_head_object(s3_client, config['s3']['bucket'], file)['LastModified']
+        tkey = thumbnail_key(config, file)
+        try:
+            tkey_meta = s3_head_object(s3_client, config['s3']['roundworm_bucket'], tkey)
+            generate = tkey_meta['LastModified'] < file_lastmod
+        except Exception: # Not found
+            generate = True
+        if generate:
+            fl = file.lower()
+            if fl.endswith('.jpg') or fl.endswith('.png'):
+                write = s3_get_object(s3_client, config, file)
+                proc = subprocess.Popen(['convert', '-resize', '{size}x{size}'.format(size=config['thumbnail_size']), '-', '-'],
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                write(proc.stdin)
+                proc.stdin.close()
+                s3_put_object(s3_client, config, tkey, proc.stdout.read())
+            elif fl.endswith('.mkv') or fl.endswith('.webm') or fl.endswith('.mp4'):
+                write = s3_get_object(s3_client, config, file)
+                with tempfile.NamedTemporaryFile() as tf:
+                    write(tf)
+                    tf.flush()
+                    # fixme don't use tempfile
+                    proc = subprocess.Popen(['ffmpeg', '-hide_banner', '-v', 'quiet', '-i', tf.name, '-ss', '1', '-frames:v', '1', '-vf', 'scale=w={size}:h={size}:force_original_aspect_ratio=decrease'.format(size=config['thumbnail_size']), '-f', 'image2pipe', '-'],
+                                            stdout=subprocess.PIPE)
+                    s3_put_object(s3_client, config, tkey, proc.communicate()[0])
+            else:
+                print('  Don\'t know how to generate a thumbnail for this file')
+        else:
+            print('  Skipping generation as it\'s up to date')
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.set_defaults(func=lambda args: sys.exit(1))
+    subparsers = parser.add_subparsers()
+
+    parser_serve = subparsers.add_parser('serve', help='serve S3 objects')
+    parser_serve.set_defaults(func=serve)
+    parser_serve.add_argument(
+        'config', type=argparse.FileType('r'),
+        help='config filename')
+
+    parser_get_share_url = subparsers.add_parser(
+        'get-share-url',
+        help='Get a sharable URL')
+    parser_get_share_url.set_defaults(func=get_share_url)
+    parser_get_share_url.add_argument(
+        'config', type=argparse.FileType('r'),
+        help='config filename')
+    parser_get_share_url.add_argument(
+        'path', type=str,
+        help='a directory (ends with a slash) or a file')
+
+    parser_generate_thumbnails = subparsers.add_parser(
+        'generate-thumbnails',
+        help='generate thumbnails for all or some media files')
+    parser_generate_thumbnails.set_defaults(func=generate_thumbnails)
+    parser_generate_thumbnails.add_argument(
+        'config', type=argparse.FileType('r'),
+        help='config filename')
+
+    args = parser.parse_args()
+    args.func(args)
+
+main()
