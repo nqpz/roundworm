@@ -298,7 +298,7 @@ def serve(args):
     s3_client = s3_make_client(config)
 
     static_files = config.get('static_files', [])
-    static_files = {name: read_file(name) for name in static_files}
+    static_files = {name: read_file(os.path.join(base_dir, name)) for name in static_files}
 
     app = Flask(__name__)
     _handle_request = lambda path: handle_request(s3_client, static_files, config, path)
