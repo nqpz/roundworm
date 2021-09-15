@@ -306,7 +306,7 @@ def serve(args):
     app.add_url_rule('/<path:path>', view_func=_handle_request)
 
     gunicorn_options = {
-        'bind': '{}:{}'.format('0.0.0.0', config['http_port']),
+        'bind': '{}:{}'.format('127.0.0.1', config['http_port']),
         'workers': config['http_workers'],
     }
     GunicornStandaloneApplication(app, gunicorn_options).run()
