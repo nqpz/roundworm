@@ -45,13 +45,21 @@ def s3_list_objects(s3_client, config, prefix, single_level=True):
     }
     if single_level:
         args['Delimiter'] = '/'
-    response = s3_client.list_objects_v2(**args)
-    assert not response['IsTruncated'], 'FIXME: handle IsTruncated responses'
+
+    files = []
     if single_level:
-        common_prefixes = response.get('CommonPrefixes', [])
-        dirs = [item['Prefix'][len(prefix):] for item in common_prefixes]
-    contents = response.get('Contents', [])
-    files = [[item['Key'][len(prefix):], item['Size']] for item in contents]
+        dirs = []
+    while True:
+        response = s3_client.list_objects_v2(**args)
+        if single_level:
+            common_prefixes = response.get('CommonPrefixes', [])
+            dirs.extend(item['Prefix'][len(prefix):] for item in common_prefixes)
+        contents = response.get('Contents', [])
+        files.extend([item['Key'][len(prefix):], item['Size']] for item in contents)
+        if response['IsTruncated']:
+            args['ContinuationToken'] = response['NextContinuationToken']
+        else:
+            break
     if single_level:
         return dirs, files
     else:
