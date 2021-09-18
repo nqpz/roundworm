@@ -3,10 +3,11 @@ with import <nixpkgs> {};
 
 mkShell {
   buildInputs = [
-    (python3.withPackages (ps: with ps; [ flask gunicorn boto3 humanfriendly ]))
+    (python3.withPackages (ps: with ps; [ flask gunicorn boto3 humanfriendly pypandoc ]))
     imagemagick
     ffmpeg
     inkscape
     libreoffice
+    pandoc
   ];
 }

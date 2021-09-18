@@ -29,6 +29,7 @@ from flask import Flask, request, redirect
 import gunicorn.app.base
 import boto3
 import humanfriendly
+import pypandoc
 
 roundworm_version = 0
 roundworm_url = 'https://github.com/nqpz/roundworm'
@@ -281,17 +282,36 @@ def render_dir(s3_client, config, path, auth):
 
     return template.format(path=path, body=body)
 
+def render_html(s3_client, config, path):
+    write = s3_get_object(s3_client, config, path)
+    with io.BytesIO() as contents:
+        write(contents)
+        return contents.getvalue()
+
+def render_pandoc(s3_client, config, path):
+    write = s3_get_object(s3_client, config, path)
+    with io.BytesIO() as contents:
+        write(contents)
+        return pypandoc.convert_text(contents.getvalue().decode('utf-8'), 'html', format=os.path.splitext(path)[1][1:]).encode('utf-8')
+
+special_renders = {
+    'html': render_html,
+    'htm': render_html,
+    'md': render_pandoc,
+    'org': render_pandoc,
+    'rst': render_pandoc,
+}
+
 def render(s3_client, config, path, auth):
     if is_dir(path):
         return render_dir(s3_client, config, path, auth)
-    elif path.endswith('.html') or path.endswith('.htm'):
-        write = s3_get_object(s3_client, config, path)
-        with io.BytesIO() as contents:
-            write(contents)
-            return contents.getvalue()
     else:
-        return redirect(s3_sign_url(s3_client, config, path) if auth != 'none'
-                        else s3_get_url(config, path))
+        handle = special_renders.get(os.path.splitext(path)[1][1:])
+        if handle is not None:
+            return handle(s3_client, config, path)
+        else:
+            return redirect(s3_sign_url(s3_client, config, path) if auth != 'none'
+                            else s3_get_url(config, path))
 
 def handle_request(s3_client, static_files, config, path):
     static = static_files.get(path)
