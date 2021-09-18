@@ -23,6 +23,7 @@ import base64
 import urllib
 import subprocess
 import tempfile
+import io
 
 from flask import Flask, request, redirect
 import gunicorn.app.base
@@ -222,64 +223,72 @@ def read_file(name):
 base_dir = os.path.dirname(__file__)
 template = read_file(os.path.join(base_dir, 'template.html'))
 
+def render_dir(s3_client, config, path, auth):
+    sig = request.args.get('s')
+
+    show = request.args.get('show', 'list')
+    show_url_part = '' if show == 'list' else ('&' if sig is not None else '?') + 'show=thumbnails'
+
+    s_maybe = '?s={}'.format(sig) if sig is not None else ''
+    to_url = lambda path1: urllib.parse.quote(path1) + s_maybe
+    dirs, files = s3_list_objects(s3_client, config, path)
+
+    hparts0 = path.rstrip('/').split('/')
+    prev_hparts0 = ''
+    hparts = []
+    for part0, i in zip(hparts0, range(len(hparts0))):
+        part = prev_hparts0 + '/' + part0
+        hparts.append((i + 1, part + '/', part0))
+        prev_hparts0 = part
+    _sig_is_dir, sig_n_slashes, _sig_digest = sig_parts(sig)
+    body = '<div><h1>{}/</h1></div>\n'.format('/'.join('<a href="{}">{}</a>'.format(to_url(part[1]) + show_url_part, part[2]) if sig_n_slashes <= part[0] and part[0] < len(hparts) else part[2] for part in hparts))
+
+    body += '<div>'
+    for file in files:
+        file.append(to_url(file[0]))
+    if show == 'list':
+        body += '<ul>'
+        body += '\n'.join('<li><a href="{}">{}</a></li>'.format(to_url(dir) + show_url_part, dir) for dir in dirs) + '\n'
+        body += '\n'.join('<li><a href="{}">{}</a> ({})</li>'.format(file[2], file[0], humanfriendly.format_size(file[1])) for file in files) + '\n'
+        body += '</ul>\n'
+    elif show == 'thumbnails':
+        body += '<ul>'
+        body += '\n'.join('<li><a href="{}">{}</a></li>'.format(to_url(dir) + show_url_part, dir) for dir in dirs)
+        body += '</ul></div><div class="thumbnails">'
+        maybe_img = lambda file: '<img src="{}">'.format(thumbnail_url(config, path + file[0])) if file_extensions.get(os.path.splitext(file[0])[1][1:].lower()) is not None else ''
+        body += '\n'.join('<div><a href="{}">{}<span>{} ({})</span></a></div>'.format(file[2], maybe_img(file), file[0], humanfriendly.format_size(file[1])) for file in files)
+
+    body += '</div>'
+
+    footer = ''
+
+    list_html = '<span class="picked">List</span>' if show == 'list' else '<a href="?s={}">List</a>'.format(sig)
+    thumbnails_html = '<span class="picked">Thumbnails</span>' if show == 'thumbnails' else '<a href="?s={}&show=thumbnails">Thumbnails</a>'.format(sig)
+    footer += '<p>Show: {} | {}</p>\n'.format(list_html, thumbnails_html)
+
+    if share_sig(config, path) != sig:
+        url = share_url(config, path)
+        if url is not None:
+            footer += '<p>Share this directory only: <input value="{}" readonly></p>\n'.format(url)
+
+    curl_command = 'curl {}-L# '.format('--basic --user <username> ' if auth == 'http' else '') + ' '.join('-o {} {}'.format(file[0], 'https://{}/{}'.format(config['domain'], urllib.parse.quote(path) + file[2])) for file in files)
+    footer += '<p>Download all files in this directory: <input value="{}" readonly></p>\n'.format(curl_command)
+
+    if footer != '':
+        body += '<hr>\n<div>{}</div>'.format(footer)
+
+    body += '<hr>\n<div><p class="secondary">Powered by <a href="{}">roundworm</a> version {}.</p></div>\n'.format(roundworm_url, roundworm_version)
+
+    return template.format(path=path, body=body)
+
 def render(s3_client, config, path, auth):
     if is_dir(path):
-        sig = request.args.get('s')
-
-        show = request.args.get('show', 'list')
-        show_url_part = '' if show == 'list' else ('&' if sig is not None else '?') + 'show=thumbnails'
-
-        s_maybe = '?s={}'.format(sig) if sig is not None else ''
-        to_url = lambda path1: urllib.parse.quote(path1) + s_maybe
-        dirs, files = s3_list_objects(s3_client, config, path)
-
-        hparts0 = path.rstrip('/').split('/')
-        prev_hparts0 = ''
-        hparts = []
-        for part0, i in zip(hparts0, range(len(hparts0))):
-            part = prev_hparts0 + '/' + part0
-            hparts.append((i + 1, part + '/', part0))
-            prev_hparts0 = part
-        _sig_is_dir, sig_n_slashes, _sig_digest = sig_parts(sig)
-        body = '<div><h1>{}/</h1></div>\n'.format('/'.join('<a href="{}">{}</a>'.format(to_url(part[1]) + show_url_part, part[2]) if sig_n_slashes <= part[0] and part[0] < len(hparts) else part[2] for part in hparts))
-
-        body += '<div>'
-        for file in files:
-            file.append(to_url(file[0]))
-        if show == 'list':
-            body += '<ul>'
-            body += '\n'.join('<li><a href="{}">{}</a></li>'.format(to_url(dir) + show_url_part, dir) for dir in dirs) + '\n'
-            body += '\n'.join('<li><a href="{}">{}</a> ({})</li>'.format(file[2], file[0], humanfriendly.format_size(file[1])) for file in files) + '\n'
-            body += '</ul>\n'
-        elif show == 'thumbnails':
-            body += '<ul>'
-            body += '\n'.join('<li><a href="{}">{}</a></li>'.format(to_url(dir) + show_url_part, dir) for dir in dirs)
-            body += '</ul></div><div class="thumbnails">'
-            maybe_img = lambda file: '<img src="{}">'.format(thumbnail_url(config, path + file[0])) if file_extensions.get(os.path.splitext(file[0])[1][1:].lower()) is not None else ''
-            body += '\n'.join('<div><a href="{}">{}<span>{} ({})</span></a></div>'.format(file[2], maybe_img(file), file[0], humanfriendly.format_size(file[1])) for file in files)
-
-        body += '</div>'
-
-        footer = ''
-
-        list_html = '<span class="picked">List</span>' if show == 'list' else '<a href="?s={}">List</a>'.format(sig)
-        thumbnails_html = '<span class="picked">Thumbnails</span>' if show == 'thumbnails' else '<a href="?s={}&show=thumbnails">Thumbnails</a>'.format(sig)
-        footer += '<p>Show: {} | {}</p>\n'.format(list_html, thumbnails_html)
-
-        if share_sig(config, path) != sig:
-            url = share_url(config, path)
-            if url is not None:
-                footer += '<p>Share this directory only: <input value="{}" readonly></p>\n'.format(url)
-
-        curl_command = 'curl {}-L# '.format('--basic --user <username> ' if auth == 'http' else '') + ' '.join('-o {} {}'.format(file[0], 'https://{}/{}'.format(config['domain'], urllib.parse.quote(path) + file[2])) for file in files)
-        footer += '<p>Download all files in this directory: <input value="{}" readonly></p>\n'.format(curl_command)
-
-        if footer != '':
-            body += '<hr>\n<div>{}</div>'.format(footer)
-
-        body += '<hr>\n<div><p class="secondary">Powered by <a href="{}">roundworm</a> version {}.</p></div>\n'.format(roundworm_url, roundworm_version)
-
-        return template.format(path=path, body=body)
+        return render_dir(s3_client, config, path, auth)
+    elif path.endswith('.html') or path.endswith('.htm'):
+        write = s3_get_object(s3_client, config, path)
+        with io.BytesIO() as contents:
+            write(contents)
+            return contents.getvalue()
     else:
         return redirect(s3_sign_url(s3_client, config, path) if auth != 'none'
                         else s3_get_url(config, path))
