@@ -36,6 +36,20 @@ ul {
   flex-wrap: wrap;
 }
 
-.thumbnails img {
-  display: block;
+.thumbnails div {
+  border-width: 1px;
+  border-style: solid;
+  border-color: black;
+  width: 400px;
+  height: 400px;
+  position: relative;
+}
+
+.thumbnails div span {
+  position: absolute;
+  bottom: 5px;
+  left: 5px;
+  right: 5px;
+  padding: 5px;
+  background: rgba(255, 255, 255, 0.7);
 }

@@ -244,7 +244,8 @@ def render(s3_client, config, path, auth):
             body += '<ul>'
             body += '\n'.join('<li><a href="{}">{}</a></li>'.format(to_url(dir) + show_url_part, dir) for dir in dirs)
             body += '</ul></div><div class="thumbnails">'
-            body += '\n'.join('<div><a href="{}"><img src="{}">{} ({})</a></div>'.format(file[2], thumbnail_url(config, path + file[0]), file[0], humanfriendly.format_size(file[1])) for file in files)
+            maybe_img = lambda file: '<img src="{}">'.format(thumbnail_url(config, path + file[0])) if file_extensions.get(os.path.splitext(file[0])[1][1:].lower()) is not None else ''
+            body += '\n'.join('<div><a href="{}">{}<span>{} ({})</span></a></div>'.format(file[2], maybe_img(file), file[0], humanfriendly.format_size(file[1])) for file in files)
 
         body += '</div>'
 
