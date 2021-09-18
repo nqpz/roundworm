@@ -483,7 +483,7 @@ def generate_thumbnails(args):
 
     n = len(files)
     for filename, i in zip(files, range(1, n + 1)):
-        # fixme: video as well + check if necessary + support regenerating only one prefix + parallelize + max 400 on either width or height + clean unused files
+        # FIXME: Parallelize.
         print('{}/{}'.format(i, n), file=sys.stderr)
         file_lastmod = s3_head_object(s3_client, config['s3']['bucket'], filename)['LastModified']
         tkey = thumbnail_key(config, filename)
