@@ -33,6 +33,9 @@ import pypandoc
 
 roundworm_version = 0
 roundworm_url = 'https://github.com/nqpz/roundworm'
+base_dir = os.path.dirname(__file__)
+newest_commit = subprocess.run(['git', '-C', base_dir, 'log', '--pretty=format:%h', 'HEAD^..HEAD'],
+                               stdout=subprocess.PIPE).stdout.decode().strip()
 
 def b64encode(data, pad=True):
     data_encoded = base64.urlsafe_b64encode(data)
@@ -221,7 +224,6 @@ def read_file(name):
     with open(name, 'r') as f:
         return f.read()
 
-base_dir = os.path.dirname(__file__)
 template = read_file(os.path.join(base_dir, 'template.html'))
 
 def render_dir(s3_client, config, path, auth):
@@ -278,7 +280,7 @@ def render_dir(s3_client, config, path, auth):
     if footer != '':
         body += '<hr>\n<div>{}</div>'.format(footer)
 
-    body += '<hr>\n<div><p class="secondary">Powered by <a href="{}">roundworm</a> version {}.</p></div>\n'.format(roundworm_url, roundworm_version)
+    body += '<hr>\n<div><p class="secondary">Powered by <a href="{}">roundworm</a> version {} (commit: {}).</p></div>\n'.format(roundworm_url, roundworm_version, newest_commit)
 
     return template.format(path=path, body=body)
 

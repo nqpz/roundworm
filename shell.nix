@@ -9,5 +9,6 @@ mkShell {
     inkscape
     libreoffice
     pandoc
+    git
   ];
 }
