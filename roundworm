@@ -32,6 +32,12 @@ import humanfriendly
 roundworm_version = 0
 roundworm_url = 'https://github.com/nqpz/roundworm'
 
+def b64encode(data):
+    return base64.urlsafe_b64encode(data).rstrip(b'=')
+
+def b64decode(data):
+    return base64.urlsafe_b64decode(data + b'=' * ((4 - len(data)) % 4))
+
 def s3_make_client(config):
     return boto3.client('s3',
                         aws_access_key_id=config['s3']['access_key_id'],
@@ -124,10 +130,10 @@ def share_sig(config, path):
         str(path.count('/')).encode(),
         digest_path(config, path)
     ])
-    return base64.urlsafe_b64encode(data).decode('utf-8')
+    return b64encode(data).decode('utf-8')
 
 def sig_parts(sig):
-    sig_data = base64.urlsafe_b64decode(sig.encode('utf-8'))
+    sig_data = b64decode(sig.encode('utf-8'))
     sig_parts = sig_data.split(b'_', 3)
     assert int(sig_parts[0]) == roundworm_version, 'this program only supports version 0 signed URLs'
     sig_is_dir = int(sig_parts[1]) == 1
@@ -197,7 +203,7 @@ def check_sig(config, path):
 
 def thumbnail_key(config, path):
     return 'thumbnails/{}/{}.jpg'.format(
-        base64.urlsafe_b64encode(digest_path(config, path)).decode(),
+        b64encode(digest_path(config, path)).decode(),
         path)
 
 def thumbnail_url(config, path):
