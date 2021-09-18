@@ -32,8 +32,11 @@ import humanfriendly
 roundworm_version = 0
 roundworm_url = 'https://github.com/nqpz/roundworm'
 
-def b64encode(data):
-    return base64.urlsafe_b64encode(data).rstrip(b'=')
+def b64encode(data, pad=True):
+    data_encoded = base64.urlsafe_b64encode(data)
+    if not pad:
+        data_encoded = data_encoded.rstrip(b'=')
+    return data_encoded
 
 def b64decode(data):
     return base64.urlsafe_b64decode(data + b'=' * ((4 - len(data)) % 4))
@@ -130,7 +133,7 @@ def share_sig(config, path):
         str(path.count('/')).encode(),
         digest_path(config, path)
     ])
-    return b64encode(data).decode('utf-8')
+    return b64encode(data, pad=False).decode('utf-8')
 
 def sig_parts(sig):
     sig_data = b64decode(sig.encode('utf-8'))
