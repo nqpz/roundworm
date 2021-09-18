@@ -139,7 +139,9 @@ def check_share_sig(config, path, sig):
     sig_is_dir, sig_n_slashes, sig_digest = sig_parts(sig)
     path_n_slashes = path.count('/')
     if sig_is_dir and (sig_n_slashes < path_n_slashes or not is_dir(path)):
+        path = '/' + path
         path = path.rsplit('/', path_n_slashes - sig_n_slashes + 1)[0] + '/'
+        path = path[1:]
         assert auth_required(config, path) in ['sign', 'http']
     path_digest = digest_path(config, path)
 
