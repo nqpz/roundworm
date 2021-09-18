@@ -328,6 +328,97 @@ def get_share_url(args):
         sys.exit(1)
     print(url)
 
+def thumbnail_image(s3_client, config, filename, thumbnail_key, input='-', pre_args=[]):
+    write = s3_get_object(s3_client, config, filename)
+    proc = subprocess.Popen(['convert', '-background', 'white', '-alpha', 'remove'] + pre_args + ['-resize', '{size}x{size}'.format(size=config['thumbnail_size']), input, 'jpg:-'],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    write(proc.stdin)
+    proc.stdin.close()
+    s3_put_object(s3_client, config, thumbnail_key, proc.stdout.read())
+
+def thumbnail_image_first(s3_client, config, filename, thumbnail_key):
+    # Convert only the first page.
+    return thumbnail_image(s3_client, config, filename, thumbnail_key, input='-[0]', pre_args=['-density', '300'])
+
+def thumbnail_inkscape(s3_client, config, filename, thumbnail_key):
+    write = s3_get_object(s3_client, config, filename)
+    proc_inkscape = subprocess.Popen(['inkscape', '--export-type=png', '--export-filename=-', '--pipe'],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    proc_convert = subprocess.Popen(['convert', '-background', 'white', '-alpha', 'remove', '-resize', '{size}x{size}'.format(size=config['thumbnail_size']), '-', 'jpg:-'],
+                                    stdin=proc_inkscape.stdout, stdout=subprocess.PIPE)
+    write(proc_inkscape.stdin)
+    proc_inkscape.stdin.close()
+    s3_put_object(s3_client, config, thumbnail_key, proc_convert.stdout.read())
+
+def thumbnail_xcf(s3_client, config, filename, thumbnail_key):
+    return thumbnail_image(s3_client, config, filename, thumbnail_key, pre_args=['-flatten'])
+
+def thumbnail_doc(s3_client, config, filename, thumbnail_key):
+    write = s3_get_object(s3_client, config, filename)
+    # FIXME: Don't use temporary files.  We should be able to not have to go
+    # through the disk here.
+    with tempfile.TemporaryDirectory() as temp_dir:
+        base_filename = os.path.basename(filename)
+        with open(os.path.join(temp_dir, base_filename), 'wb') as f:
+            write(f)
+        pdf_filename = os.path.join(temp_dir, base_filename.rsplit('.', 1)[0] + '.pdf')
+        subprocess.run(['soffice', '--headless', '--convert-to', 'pdf', base_filename],
+                       cwd=temp_dir)
+        convert_completed = subprocess.run(['convert', '-background', 'white', '-alpha', 'remove', '-resize', '{size}x{size}'.format(size=config['thumbnail_size']), pdf_filename, 'jpg:-'],
+                                           capture_output=True)
+        s3_put_object(s3_client, config, thumbnail_key, convert_completed.stdout)
+
+def thumbnail_video(s3_client, config, filename, thumbnail_key):
+    write = s3_get_object(s3_client, config, filename)
+    with tempfile.NamedTemporaryFile() as tf:
+        write(tf)
+        tf.flush()
+        # FIXME: Don't use a temporary file.  We only need the first parts of
+        # the video to get a thumbnail, but currently we download all of it.
+        proc = subprocess.Popen(['ffmpeg', '-hide_banner', '-v', 'quiet', '-i', tf.name, '-ss', '1', '-frames:v', '1', '-vf', 'scale=w={size}:h={size}:force_original_aspect_ratio=decrease'.format(size=config['thumbnail_size']), '-f', 'image2pipe', '-'],
+                                stdout=subprocess.PIPE)
+        s3_put_object(s3_client, config, thumbnail_key, proc.communicate()[0])
+
+file_extensions = {
+    'jpg': thumbnail_image,
+    'jpeg': thumbnail_image,
+    'png': thumbnail_image,
+    'gif': thumbnail_image,
+    'webp': thumbnail_image,
+
+    'pdf': thumbnail_image_first,
+    'ps': thumbnail_image_first,
+    'eps': thumbnail_image_first,
+    'dvi': thumbnail_image_first,
+    'svg': thumbnail_inkscape,
+    'svgz': thumbnail_inkscape,
+    'emf': thumbnail_inkscape,
+    'wmf': thumbnail_inkscape,
+    'xcf': thumbnail_xcf,
+
+    'mkv': thumbnail_video,
+    'webm': thumbnail_video,
+    'mp4': thumbnail_video,
+    'mts': thumbnail_video,
+    'avi': thumbnail_video,
+    'mpg': thumbnail_video,
+    'mpeg': thumbnail_video,
+    'm2t': thumbnail_video,
+    'mov': thumbnail_video,
+    'flv': thumbnail_video,
+
+    'odt': thumbnail_doc,
+    'ods': thumbnail_doc,
+    'odp': thumbnail_doc,
+    'doc': thumbnail_doc,
+    'docx': thumbnail_doc,
+    'xls': thumbnail_doc,
+    'xlsx': thumbnail_doc,
+    'ppt': thumbnail_doc,
+    'pptx': thumbnail_doc,
+    'rtf': thumbnail_doc,
+}
+
 def generate_thumbnails(args):
     config = load_config(args.config)
     s3_client = s3_make_client(config)
@@ -348,38 +439,25 @@ def generate_thumbnails(args):
         files.extend(prefix + item[0] for item in s3_list_objects(s3_client, config, prefix, single_level=False))
 
     n = len(files)
-    for file, i in zip(files, range(1, n + 1)):
+    for filename, i in zip(files, range(1, n + 1)):
         # fixme: video as well + check if necessary + support regenerating only one prefix + parallelize + max 400 on either width or height + clean unused files
-        print('{:03d}/{:03d}'.format(i, n), file)
-        file_lastmod = s3_head_object(s3_client, config['s3']['bucket'], file)['LastModified']
-        tkey = thumbnail_key(config, file)
+        print('{}/{}'.format(i, n), file=sys.stderr)
+        file_lastmod = s3_head_object(s3_client, config['s3']['bucket'], filename)['LastModified']
+        tkey = thumbnail_key(config, filename)
         try:
             tkey_meta = s3_head_object(s3_client, config['s3']['roundworm_bucket'], tkey)
-            generate = tkey_meta['LastModified'] < file_lastmod
-        except Exception: # Not found
-            generate = True
-        if generate:
-            fl = file.lower()
-            if fl.endswith('.jpg') or fl.endswith('.png'):
-                write = s3_get_object(s3_client, config, file)
-                proc = subprocess.Popen(['convert', '-resize', '{size}x{size}'.format(size=config['thumbnail_size']), '-', '-'],
-                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-                write(proc.stdin)
-                proc.stdin.close()
-                s3_put_object(s3_client, config, tkey, proc.stdout.read())
-            elif fl.endswith('.mkv') or fl.endswith('.webm') or fl.endswith('.mp4'):
-                write = s3_get_object(s3_client, config, file)
-                with tempfile.NamedTemporaryFile() as tf:
-                    write(tf)
-                    tf.flush()
-                    # fixme don't use tempfile
-                    proc = subprocess.Popen(['ffmpeg', '-hide_banner', '-v', 'quiet', '-i', tf.name, '-ss', '1', '-frames:v', '1', '-vf', 'scale=w={size}:h={size}:force_original_aspect_ratio=decrease'.format(size=config['thumbnail_size']), '-f', 'image2pipe', '-'],
-                                            stdout=subprocess.PIPE)
-                    s3_put_object(s3_client, config, tkey, proc.communicate()[0])
+            do_generate = tkey_meta['LastModified'] < file_lastmod
+        except Exception: # Not found in cache
+            do_generate = True
+        if do_generate:
+            fl = filename.lower()
+            _, ext = os.path.splitext(fl)
+            ext = ext[1:]
+            handle = file_extensions.get(ext)
+            if handle is not None:
+                handle(s3_client, config, filename, tkey)
             else:
-                print('  Don\'t know how to generate a thumbnail for this file')
-        else:
-            print('  Skipping generation as it\'s up to date')
+                print('unknown file extension {} in {}'.format(repr(ext), repr(filename)), file=sys.stderr)
 
 def main():
     parser = argparse.ArgumentParser()

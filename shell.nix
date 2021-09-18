@@ -6,5 +6,7 @@ mkShell {
     (python3.withPackages (ps: with ps; [ flask gunicorn boto3 humanfriendly ]))
     imagemagick
     ffmpeg
+    inkscape
+    libreoffice
   ];
 }
