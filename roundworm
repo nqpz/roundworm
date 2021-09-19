@@ -24,6 +24,7 @@ import urllib
 import subprocess
 import tempfile
 import io
+import re
 
 from flask import Flask, request, redirect
 import gunicorn.app.base
@@ -209,6 +210,9 @@ def check_sig(config, path):
     sig = request.args.get('s')
     return sig is not None and check_share_sig(config, path, sig)
 
+def get_extension(filename):
+    return os.path.splitext(filename)[1][1:].lower()
+
 def thumbnail_key(config, path):
     return 'thumbnails/{}/{}.jpg'.format(
         b64encode(digest_path(config, path)).decode(),
@@ -258,7 +262,7 @@ def render_dir(s3_client, config, path, auth):
         body += '<ul>'
         body += '\n'.join('<li><a href="{}">{}</a></li>'.format(to_url(dir) + show_url_part, dir) for dir in dirs)
         body += '</ul></div><div class="thumbnails">'
-        maybe_img = lambda file: '<img src="{}">'.format(thumbnail_url(config, path + file[0])) if file_extensions.get(os.path.splitext(file[0])[1][1:].lower()) is not None else ''
+        maybe_img = lambda file: '<img src="{}">'.format(thumbnail_url(config, path + file[0])) if file_extensions_re.match(get_extension(file[0])) is not None else ''
         body += '\n'.join('<div><a href="{}">{}<span>{} ({})</span></a></div>'.format(file[2], maybe_img(file), file[0], humanfriendly.format_size(file[1])) for file in files)
 
     body += '</div>'
@@ -294,7 +298,7 @@ def render_pandoc(s3_client, config, path):
     write = s3_get_object(s3_client, config, path)
     with io.BytesIO() as contents:
         write(contents)
-        return pypandoc.convert_text(contents.getvalue().decode('utf-8'), 'html', format=os.path.splitext(path)[1][1:]).encode('utf-8')
+        return pypandoc.convert_text(contents.getvalue().decode('utf-8'), 'html', format=get_extension(path)).encode('utf-8')
 
 special_renders = {
     'html': render_html,
@@ -308,7 +312,7 @@ def render(s3_client, config, path, auth):
     if is_dir(path):
         return render_dir(s3_client, config, path, auth)
     else:
-        handle = special_renders.get(os.path.splitext(path)[1][1:])
+        handle = special_renders.get(get_extension(path))
         if handle is not None:
             return handle(s3_client, config, path)
         else:
@@ -462,6 +466,18 @@ file_extensions = {
     'rtf': thumbnail_doc,
 }
 
+file_extensions_re = re.compile('|'.join(file_extensions.keys()))
+
+thumbnail_ignore_paths = list(map(re.compile, [
+    r'/.git/',
+]))
+
+def thumbnail_accept_path(path):
+    for r in thumbnail_ignore_paths:
+        if r.search(path):
+            return False
+    return True
+
 def generate_thumbnails(args):
     config = load_config(args.config)
     s3_client = s3_make_client(config)
@@ -479,28 +495,32 @@ def generate_thumbnails(args):
 
     files = []
     for prefix in prefixes_to_handle:
-        files.extend(prefix + item[0] for item in s3_list_objects(s3_client, config, prefix, single_level=False))
+        prefix_paths = (prefix + item[0]
+                        for item
+                        in s3_list_objects(s3_client, config, prefix, single_level=False))
+        prefix_paths = filter(thumbnail_accept_path, prefix_paths)
+        prefix_paths = ((path, get_extension(path)) for path in prefix_paths)
+        prefix_paths = ((path, ext) for path, ext in prefix_paths
+                        if file_extensions_re.match(ext))
+        files.extend(prefix_paths)
 
     n = len(files)
-    for filename, i in zip(files, range(1, n + 1)):
+    for info, i in zip(files, range(1, n + 1)):
+        filename, ext = info
         # FIXME: Parallelize.
         print('{}/{}'.format(i, n), file=sys.stderr)
+
         file_lastmod = s3_head_object(s3_client, config['s3']['bucket'], filename)['LastModified']
         tkey = thumbnail_key(config, filename)
         try:
             tkey_meta = s3_head_object(s3_client, config['s3']['roundworm_bucket'], tkey)
-            do_generate = tkey_meta['LastModified'] < file_lastmod
+            if tkey_meta['LastModified'] >= file_lastmod:
+                continue
         except Exception: # Not found in cache
-            do_generate = True
-        if do_generate:
-            fl = filename.lower()
-            _, ext = os.path.splitext(fl)
-            ext = ext[1:]
-            handle = file_extensions.get(ext)
-            if handle is not None:
-                handle(s3_client, config, filename, tkey)
-            else:
-                print('unknown file extension {} in {}'.format(repr(ext), repr(filename)), file=sys.stderr)
+            pass
+
+        handle = file_extensions[ext]
+        handle(s3_client, config, filename, tkey)
 
 def main():
     parser = argparse.ArgumentParser()
