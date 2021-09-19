@@ -3,7 +3,7 @@ with import <nixpkgs> {};
 
 mkShell {
   buildInputs = [
-    (python3.withPackages (ps: with ps; [ flask gunicorn boto3 humanfriendly pypandoc ]))
+    (python3.withPackages (ps: with ps; [ flask gunicorn boto3 humanfriendly pypandoc progress ]))
     imagemagick
     ffmpeg
     inkscape

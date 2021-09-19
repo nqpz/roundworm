@@ -31,6 +31,8 @@ import gunicorn.app.base
 import boto3
 import humanfriendly
 import pypandoc
+from progress.spinner import Spinner
+from progress.bar import Bar
 
 roundworm_version = 0
 roundworm_url = 'https://github.com/nqpz/roundworm'
@@ -482,6 +484,8 @@ def generate_thumbnails(args):
     config = load_config(args.config)
     s3_client = s3_make_client(config)
 
+    spinner = Spinner('Finding files ')
+
     prefixes_to_handle = []
     def check_prefixes(prefixes):
         for prefix, info in prefixes.items():
@@ -495,6 +499,7 @@ def generate_thumbnails(args):
 
     files = []
     for prefix in prefixes_to_handle:
+        spinner.next()
         prefix_paths = (prefix + item[0]
                         for item
                         in s3_list_objects(s3_client, config, prefix, single_level=False))
@@ -503,24 +508,26 @@ def generate_thumbnails(args):
         prefix_paths = ((path, ext) for path, ext in prefix_paths
                         if file_extensions_re.match(ext))
         files.extend(prefix_paths)
+    spinner.finish()
 
     n = len(files)
+    bar = Bar('Processing', max=n)
+    # FIXME: Parallelize.
     for info, i in zip(files, range(1, n + 1)):
         filename, ext = info
-        # FIXME: Parallelize.
-        print('{}/{}'.format(i, n), file=sys.stderr)
-
         file_lastmod = s3_head_object(s3_client, config['s3']['bucket'], filename)['LastModified']
         tkey = thumbnail_key(config, filename)
         try:
             tkey_meta = s3_head_object(s3_client, config['s3']['roundworm_bucket'], tkey)
             if tkey_meta['LastModified'] >= file_lastmod:
+                bar.next()
                 continue
         except Exception: # Not found in cache
             pass
-
         handle = file_extensions[ext]
         handle(s3_client, config, filename, tkey)
+        bar.next()
+    bar.finish()
 
 def main():
     parser = argparse.ArgumentParser()
