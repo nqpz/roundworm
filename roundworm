@@ -468,7 +468,7 @@ file_extensions = {
     'rtf': thumbnail_doc,
 }
 
-file_extensions_re = re.compile('|'.join(file_extensions.keys()))
+file_extensions_re = re.compile(r'({})$'.format(r'|'.join(file_extensions.keys())))
 
 thumbnail_ignore_paths = list(map(re.compile, [
     r'/.git/',
